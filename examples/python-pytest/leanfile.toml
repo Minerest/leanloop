@@ -1,0 +1,30 @@
+# Python + pytest example for lean-loop.
+# Exercises the "deluxe" path: pytest emits Python tracebacks that lean-loop
+# parses into (file, line, function), then it feeds the model a source window
+# around the failing line.
+
+[runner]
+command = "./venv/bin/pytest"
+args    = ["tests/", "-x", "--tb=native", "-q"]
+timeout = 60
+
+[defaults]
+project_root  = "."
+source_prefix = "src/"                           # where your library code lives
+test_prefix   = ["tests/", "test_"]              # path fragments that mark tests
+
+# -- Tasks ---------------------------------------------------------------------
+
+[[tasks]]
+name   = "add-currency-validation"
+prompt = """
+In src/billing/charge.py, the Charge model accepts any string for currency.
+Add validation that rejects anything that isn't a 3-letter uppercase ISO 4217
+code (USD, EUR, GBP, etc.). Raise ValueError on bad input.
+"""
+files = ["src/billing/charge.py"]
+
+[[tasks]]
+name   = "fix-pagination-offset"
+prompt = "list_users() in src/users/repo.py is off-by-one when offset > 0. Fix it."
+files  = ["src/users/repo.py"]

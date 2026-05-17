@@ -1,0 +1,59 @@
+# leanfile.toml — demo project for lean-loop.
+#
+# Three tasks across two tiny source files. Each task scopes its runner to
+# just the tests it cares about (via the per-task `runner` override), so
+# the fix loop doesn't trip on unrelated failures from later tasks.
+
+[runner]
+command = "pytest"
+args    = ["-x", "--tb=native", "-q"]
+timeout = 30
+
+[defaults]
+test_prefix = ["test_"]
+
+# Task 1: implement a missing function from scratch.
+# Scope tests to the slugify cases only.
+[[tasks]]
+name   = "implement-slugify"
+prompt = """
+Implement slugify() in stringutils.py. It should:
+  - Lowercase the input
+  - Replace runs of non-alphanumeric characters with a single hyphen
+  - Strip leading/trailing hyphens
+
+Examples:
+  "Hello World"   -> "hello-world"
+  "Hello, World!" -> "hello-world"
+"""
+files  = ["stringutils.py"]
+runner = { args = ["test_stringutils.py", "-k", "slugify", "-x", "--tb=native", "-q"] }
+
+# Task 2: fix a subtle off-by-one bug.
+# Scope tests to the count_words cases only.
+[[tasks]]
+name   = "fix-count-words-empty"
+prompt = """
+count_words() in stringutils.py returns 1 for an empty string instead of 0.
+Fix it so count_words("") == 0 and the normal cases still work.
+"""
+files  = ["stringutils.py"]
+runner = { args = ["test_stringutils.py", "-k", "count_words", "-x", "--tb=native", "-q"] }
+
+# Task 3: implement one function AND fix a bug in the same file.
+# Scope tests to the whole mathutils suite.
+[[tasks]]
+name   = "mathutils-fizzbuzz-and-prime"
+prompt = """
+Two changes in mathutils.py:
+
+1. Implement fizzbuzz(n) per its docstring. The four cases are: divisible by
+   15 -> "FizzBuzz"; divisible by 3 -> "Fizz"; divisible by 5 -> "Buzz";
+   otherwise str(n). Be careful with the order of checks.
+
+2. Fix is_prime(n) so values < 2 are NOT considered prime (is_prime(0) and
+   is_prime(1) should both return False). The current code returns True for
+   them.
+"""
+files  = ["mathutils.py"]
+runner = { args = ["test_mathutils.py", "-x", "--tb=native", "-q"] }

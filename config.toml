@@ -1,0 +1,28 @@
+# config.toml — STATIC defaults for leanloop.py
+#
+# Per-project leanfile.toml files deep-merge on top of this. Anything you
+# put here is shared across every project that uses this leanloop.py.
+# Anything you put in leanfile.toml overrides what's here.
+#
+# leanloop.py exports the [lean] settings as LEAN_* env vars before exec'ing
+# the wrapper at lean.binary, which is why the wrapper scripts in leaners/
+# can stay minimal.
+
+[lean]
+binary        = "./leaners/qwen.sh"                  # resolved relative to this config.toml
+base_url      = "http://127.0.0.1:8080/v1"
+api_key       = "not-needed"
+model         = "Qwen3.6-35B-A3B-UD-Q4_K_M.gguf"
+approval_mode = "yolo"
+timeout       = 600                                   # wrapper wall-clock budget per call (sec)
+
+[health]
+check_url = "http://127.0.0.1:8080/health"
+max_wait  = 60
+
+[defaults]
+source_window         = 30
+error_tail_lines      = 40
+max_iters_per_task    = 5
+after_command_timeout = 600
+project_root          = "."

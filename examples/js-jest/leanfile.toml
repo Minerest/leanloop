@@ -1,0 +1,31 @@
+# JS / TS + jest example for lean-loop.
+# Uses the language-agnostic fallback path: jest output isn't parsed into
+# frames, so the model gets the last N lines of jest output + git diff + the
+# files listed in the task.
+
+[runner]
+# `shell = true` lets us run `npm test --silent` as a shell line. Skips the
+# CLI parsing overhead and inherits node_modules/.bin from PATH naturally.
+command = "npm test -- --bail --silent"
+shell   = true
+timeout = 120
+
+[defaults]
+project_root     = "."
+error_tail_lines = 60                       # jest stack frames are wide; tail more
+
+# -- Tasks ---------------------------------------------------------------------
+
+[[tasks]]
+name   = "fix-date-formatter"
+prompt = """
+src/util/format.ts has formatDate(d) which returns "Invalid Date" when d is a
+valid ISO string. It only works for Date objects. Make it accept ISO strings
+too, by passing the input through new Date() first.
+"""
+files = ["src/util/format.ts"]
+
+[[tasks]]
+name   = "add-debounce-cleanup"
+prompt = "src/hooks/useDebounce.ts leaks timeouts when the component unmounts mid-debounce. Add a cleanup that clears the pending timeout."
+files  = ["src/hooks/useDebounce.ts"]

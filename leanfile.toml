@@ -1,0 +1,28 @@
+# leanfile.toml — per-project task config.
+# Deep-merges on top of config.toml (lean runtime, health, base defaults).
+# Only put project-specific stuff here.
+
+[runner]
+command = "./venv/bin/pytest"
+args    = ["scripts/", "-x", "--tb=native", "-q"]
+timeout = 30
+
+[defaults]
+source_prefix = "backend/app/"
+test_prefix   = ["tests/", "test_", "scripts/"]
+
+# -- Tasks ---------------------------------------------------------------------
+# Each [[task]] is a bite-sized work item. Tasks run sequentially. After each
+# task, all tests run. If they fail, the auto-fix loop kicks in (scoped to that
+# task). Each task starts with a fresh model context — no history carryover.
+
+[[tasks]]
+name   = "fix-venue-priority"
+prompt = "Fix _user_role() in offers.py so venue role takes priority over band role."
+files  = ["backend/app/routes/offers.py"]
+
+[[tasks]]
+name   = "add-genre-filter"
+prompt = "Add a 'genre' query parameter to the search endpoint that filters bands by their genre field."
+files  = ["backend/app/routes/search.py"]
+context_budget = 3000

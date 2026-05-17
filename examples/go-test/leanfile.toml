@@ -1,0 +1,29 @@
+# Go example for lean-loop.
+# Uses the language-agnostic fallback path: lean-loop doesn't parse Go panics
+# into frames, so it sends the model the last ~40 lines of `go test` output
+# plus the git diff plus the files listed in the task.
+
+[runner]
+command = "go"
+args    = ["test", "./...", "-count=1"]
+timeout = 120
+
+[defaults]
+project_root     = "."
+error_tail_lines = 50                            # Go output tends to be a bit chattier
+
+# -- Tasks ---------------------------------------------------------------------
+
+[[tasks]]
+name   = "handle-empty-input"
+prompt = """
+internal/parser/url.go panics on empty input. Make ParseURL("") return
+(URL{}, ErrEmptyInput) instead. Add ErrEmptyInput as a package-level error.
+"""
+files = ["internal/parser/url.go"]
+
+[[tasks]]
+name   = "thread-context-through-retry"
+prompt = "Retry() in internal/http/client.go ignores its ctx parameter. Make it cancel in-flight backoff sleeps when ctx is done."
+files  = ["internal/http/client.go"]
+context_budget = 6000
