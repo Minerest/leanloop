@@ -27,7 +27,7 @@ classifiers = [
 lean-loop = "leanloop:main"
 
 [project.optional-dependencies]
-dev = ["pytest>=7"]
+dev = ["pytest>=7", "httpx"]
 
 [tool.setuptools]
 py-modules = ["leanloop"]

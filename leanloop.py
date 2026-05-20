@@ -197,6 +197,65 @@ def _lean_env(config: dict) -> dict:
     return env
 
 
+# Token accounting (per task + grand total). Chars are accumulated at each
+# lean_call site so both the generating call and any fix-loop iterations
+# are credited to the active task. Tokens are estimated as chars/4 — the
+# industry-standard rule of thumb for BPE-style tokenizers. Cloud equivalent
+# is local_input_tokens * cloud_multiplier (default 5×), representing the
+# extra reads / agent fan-out a frontier cloud model would do for the same
+# work; tune via [defaults] cloud_multiplier in your leanfile.
+_TOKEN_STATS: dict = {
+    "task_in": 0, "task_out": 0, "task_calls": 0,
+    "total_in": 0, "total_out": 0, "total_calls": 0,
+    "n_tasks": 0,
+}
+
+
+def _tok_reset_task() -> None:
+    _TOKEN_STATS["task_in"] = 0
+    _TOKEN_STATS["task_out"] = 0
+    _TOKEN_STATS["task_calls"] = 0
+
+
+def _tok_record(chars_in: int, chars_out: int) -> None:
+    _TOKEN_STATS["task_in"] += chars_in
+    _TOKEN_STATS["task_out"] += chars_out
+    _TOKEN_STATS["task_calls"] += 1
+    _TOKEN_STATS["total_in"] += chars_in
+    _TOKEN_STATS["total_out"] += chars_out
+    _TOKEN_STATS["total_calls"] += 1
+
+
+def _fmt_k(n_tokens: float) -> str:
+    """Compact 'k'-suffixed token count: 540 -> '0.5k', 12345 -> '12.3k'."""
+    if n_tokens < 100:
+        return f"{int(n_tokens)}t"
+    return f"{n_tokens / 1000:.1f}k"
+
+
+def _print_token_summary(label: str, multiplier: float) -> None:
+    """One-line token summary for the current scope (task or grand total)."""
+    is_total = label.startswith("grand")
+    chars_in = _TOKEN_STATS["total_in"] if is_total else _TOKEN_STATS["task_in"]
+    chars_out = _TOKEN_STATS["total_out"] if is_total else _TOKEN_STATS["task_out"]
+    n_calls = _TOKEN_STATS["total_calls"] if is_total else _TOKEN_STATS["task_calls"]
+    if n_calls == 0:
+        return  # nothing to report — task skipped or empty
+
+    tok_in = chars_in / 4
+    tok_out = chars_out / 4
+    cloud_equiv = tok_in * multiplier
+    saved = max(0.0, cloud_equiv - tok_in)
+    ratio = (cloud_equiv / tok_in) if tok_in > 0 else 0.0
+
+    print(
+        f"  [tok] {label}: local ~{_fmt_k(tok_in)} in / ~{_fmt_k(tok_out)} out"
+        f" · cloud-equiv ~{_fmt_k(cloud_equiv)}"
+        f" · saved ~{_fmt_k(saved)} (~{ratio:.1f}×) "
+        f"[{n_calls} call{'s' if n_calls != 1 else ''}]"
+    )
+
+
 def lean_call(prompt: str, config: dict) -> str | None:
     """Run the wrapper with `-p prompt` and return stdout.
 
@@ -228,6 +287,7 @@ def lean_call(prompt: str, config: dict) -> str | None:
 
         output = result.stdout.strip() if result.stdout else ""
         if output:
+            _tok_record(len(prompt), len(output))
             return output
 
         if attempt < LEAN_MAX_EMPTY_RETRIES:
@@ -615,6 +675,12 @@ def run_fix_loop(cfg: dict, label: str = "fix loop", task: dict | None = None) -
         if retcode == 0:
             print("  [ok] Tests passed")
             return True
+        if retcode == 5:
+            # pytest exit code 5 = no tests collected or all skipped.
+            # (importorskip when the implementation module doesn't exist yet.)
+            # Not a real failure — treat as pass.
+            print("  [ok] All tests skipped (exit 5) — module not ready yet")
+            return True
         if retcode == -1:
             print("  [warn] Timeout")
             if i >= max_iters:
@@ -796,6 +862,8 @@ def _task_cfg(cfg: dict, task: dict) -> dict:
 def process_task(task: dict, cfg: dict) -> bool:
     """Process one task: model call -> tests -> fix loop -> after-commands."""
 
+    _tok_reset_task()
+
     # -- Build context -------------------------------------------------
     print(f"\n  Reading files...", flush=True)
     context = build_task_context(task, cfg)
@@ -821,16 +889,29 @@ def process_task(task: dict, cfg: dict) -> bool:
 
     # -- Run tests ------------------------------------------------------
     eff_cfg = _task_cfg(cfg, task)
-    print(f"  Running tests...", flush=True)
-    retcode, test_output = run_tests(eff_cfg)
-    if retcode == 0:
-        print(f"  [ok] All tests pass")
+    if task.get("skip_tests", False):
+        # Per-task opt-out: don't run the full test runner between the
+        # model call and the after-commands. Use this for tasks where
+        # the held-out check lives entirely in `after` (e.g. convention
+        # probes with an AST oracle), or when the runner's full-suite
+        # sweep would be noise. The fix loop is also skipped, since it's
+        # gated on test failure. After-commands still run.
+        print(f"  [skip] tests skipped (skip_tests=true)")
         passed = True
     else:
-        print(f"  [err] Tests failed — entering fix loop")
-        passed = run_fix_loop(eff_cfg, label=f"fix loop for '{task['name']}'", task=task)
+        print(f"  Running tests...", flush=True)
+        retcode, test_output = run_tests(eff_cfg)
+        if retcode == 0:
+            print(f"  [ok] All tests pass")
+            passed = True
+        else:
+            print(f"  [err] Tests failed — entering fix loop")
+            passed = run_fix_loop(eff_cfg, label=f"fix loop for '{task['name']}'", task=task)
 
     if not passed:
+        if cfg.get("defaults", {}).get("log_token_savings", True):
+            multiplier = cfg.get("defaults", {}).get("cloud_multiplier", 5.0)
+            _print_token_summary(f"task tokens ({task.get('name', '?')}, FAILED)", multiplier)
         return False
 
     # -- Post-task hooks -----------------------------------------------
@@ -841,6 +922,10 @@ def process_task(task: dict, cfg: dict) -> bool:
         if not _run_after_commands(after, project_root, timeout=after_timeout):
             return False
 
+    if cfg.get("defaults", {}).get("log_token_savings", True):
+        multiplier = cfg.get("defaults", {}).get("cloud_multiplier", 5.0)
+        _print_token_summary(f"task tokens ({task.get('name', '?')})", multiplier)
+    _TOKEN_STATS["n_tasks"] += 1
     return True
 
 
@@ -923,6 +1008,11 @@ timeout = 30                           # seconds
 # # [runner]. Scope tests to just this task so fix-loop iterations don't
 # # run the whole suite. Any pytest selector / -k expr / file path works.
 # # runner = { args = ["tests/test_my_feature.py", "-x", "--tb=native", "-q"] }
+# #
+# # Optional: skip the test phase entirely (and the fix loop). Use when the
+# # held-out check lives in `after` instead — e.g. convention probes, doc
+# # tasks, or bugfixes where you don't want the full bench suite re-run.
+# # skip_tests = true
 """
 
 
@@ -1078,6 +1168,11 @@ def _run_workload(cfg: dict, args) -> bool:
 
     print(f"\n{'=' * 60}")
     print("[ok] All tasks completed")
+
+    if cfg.get("defaults", {}).get("log_token_savings", True):
+        multiplier = cfg.get("defaults", {}).get("cloud_multiplier", 5.0)
+        n = _TOKEN_STATS["n_tasks"]
+        _print_token_summary(f"grand total across {n} task{'s' if n != 1 else ''}", multiplier)
     return True
 
 
@@ -1088,8 +1183,11 @@ def main() -> int:
                     "configured health URL.",
     )
     parser.add_argument(
-        "-c", "--config", default="leanfile.toml",
-        help="Path to per-project task config (default: leanfile.toml)",
+        "-c", "--config", nargs="+", default=["leanfile.toml"],
+        metavar="CONFIG",
+        help="Path(s) to per-project task config (default: leanfile.toml). "
+             "When multiple are given, they run sequentially in order. "
+             "If any config fails, remaining configs are skipped.",
     )
     parser.add_argument(
         "-g", "--global-config", default=None, dest="global_config",
@@ -1123,21 +1221,66 @@ def main() -> int:
     if args.set_leaner:
         return _set_leaner(args.set_leaner)
 
-    cfg = load_config(args.config, args.global_config)
+    config_paths = args.config
+    multi = len(config_paths) > 1
 
-    if not preflight_lean(cfg):
-        return 1
+    # Cross-config token totals — only meaningful when multi=True.
+    cross_in = cross_out = cross_calls = cross_tasks = 0
+    last_cfg: dict | None = None
 
-    health_url = cfg.get("health", {}).get("check_url", "http://127.0.0.1:8080/health")
-    max_wait = cfg.get("health", {}).get("max_wait", 60)
-    if not ensure_server(health_url, max_wait):
-        print(
-            f"[err] LLM server not reachable at {health_url}. "
-            f"Start it (e.g. `./leaners/qwen.sh` or your llama-server launcher) and rerun."
-        )
-        return 1
+    for idx, path in enumerate(config_paths):
+        if multi:
+            print(f"\n{'#' * 60}")
+            print(f"# Config {idx + 1}/{len(config_paths)}: {path}")
+            print(f"{'#' * 60}")
 
-    return 0 if _run_workload(cfg, args) else 1
+        cfg = load_config(path, args.global_config)
+        last_cfg = cfg
+
+        if not preflight_lean(cfg):
+            return 1
+
+        health_url = cfg.get("health", {}).get("check_url", "http://127.0.0.1:8080/health")
+        max_wait = cfg.get("health", {}).get("max_wait", 60)
+        if not ensure_server(health_url, max_wait):
+            print(
+                f"[err] LLM server not reachable at {health_url}. "
+                f"Start it (e.g. `./leaners/qwen.sh` or your llama-server launcher) and rerun."
+            )
+            return 1
+
+        # Reset per-config totals so each config gets its own "grand total" line.
+        # The cross-config grand-grand-total below sums the deltas.
+        if idx > 0:
+            _TOKEN_STATS["total_in"] = 0
+            _TOKEN_STATS["total_out"] = 0
+            _TOKEN_STATS["total_calls"] = 0
+            _TOKEN_STATS["n_tasks"] = 0
+
+        if not _run_workload(cfg, args):
+            return 1
+
+        cross_in += _TOKEN_STATS["total_in"]
+        cross_out += _TOKEN_STATS["total_out"]
+        cross_calls += _TOKEN_STATS["total_calls"]
+        cross_tasks += _TOKEN_STATS["n_tasks"]
+
+    if multi and last_cfg is not None:
+        print(f"\n{'#' * 60}")
+        print(f"[ok] All {len(config_paths)} configs completed")
+        if last_cfg.get("defaults", {}).get("log_token_savings", True):
+            _TOKEN_STATS["total_in"] = cross_in
+            _TOKEN_STATS["total_out"] = cross_out
+            _TOKEN_STATS["total_calls"] = cross_calls
+            _TOKEN_STATS["n_tasks"] = cross_tasks
+            multiplier = last_cfg.get("defaults", {}).get("cloud_multiplier", 5.0)
+            _print_token_summary(
+                f"grand total across {len(config_paths)} configs "
+                f"({cross_tasks} task{'s' if cross_tasks != 1 else ''})",
+                multiplier,
+            )
+
+    return 0
 
 
 if __name__ == "__main__":
