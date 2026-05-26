@@ -876,8 +876,15 @@ def process_task(task: dict, cfg: dict) -> bool:
     )
 
     # -- Fresh wrapper call (handles file writes natively) -----------------
+
+    # Global message propagated to every task (set in [defaults] global_message).
+    # Mechanical conventions — response shapes, import rules, naming patterns —
+    # can be written once here instead of duplicated in every task prompt.
+    global_msg = cfg.get("defaults", {}).get("global_message", "").strip()
+
     wrapper_prompt = (
-        f"Task: {task_prompt}\n\n"
+        (f"{global_msg}\n\n" if global_msg else "")
+        + f"Task: {task_prompt}\n\n"
         f"Project files:\n{context}\n\n"
         f"Current git diff:\n```diff\n{git_diff_short(None, project_root)}\n```"
     )
@@ -1148,7 +1155,24 @@ def _run_workload(cfg: dict, args) -> bool:
         return run_fix_loop(cfg, label="direct loop")
 
     task_list = tasks
-    if args.task:
+    if args.tasks:
+        indices: list[int] = []
+        for part in args.tasks.split(","):
+            part = part.strip()
+            try:
+                idx = int(part)
+            except ValueError:
+                print(f"  [warn] Invalid task index '{part}' — skipping")
+                continue
+            if idx < 1 or idx > len(tasks):
+                print(f"  [warn] Task index {idx} is out of range (1–{len(tasks)}) — skipping")
+                continue
+            indices.append(idx)
+        task_list = [tasks[i - 1] for i in indices]
+        if not task_list:
+            print("[err] No valid task indices specified")
+            return False
+    elif args.task:
         task_list = [t for t in tasks if t.get("name") == args.task]
         if not task_list:
             print(f"[err] No task named '{args.task}'")
@@ -1196,6 +1220,11 @@ def main() -> int:
     )
     parser.add_argument(
         "--task", help="Run only this task name (skips others)",
+    )
+    parser.add_argument(
+        "--tasks", metavar="INDICES",
+        help="Comma-separated 1-based task indices to run, e.g. '4,5,6,7'. "
+             "Out-of-range indices are logged and skipped. Overrides --task if both are given.",
     )
     parser.add_argument(
         "--init", nargs="?", const="-", metavar="FILE",
