@@ -14,7 +14,7 @@ Define bite-sized tasks in TOML, point it at your test runner, and let it
 iterate until the tests pass.
 
 ## The Purpose
-This is my answer to subsidizing cloud API costs with my local LLM with a workflow I can trust. The workflow I got nailed down is that I would talk with the godfather cloud AI about a feature, say something like full stack notifications for a web app. Cloud AI will read through and create the task toml file and it would kick off the lean-loop script. The local AI would do the bulk of the work autonomously leading to a 10x cloud saving expenditure according to Claude code. The savings scale linearly with feature and task length.
+This is my answer to subsidizing cloud API costs with my local LLM with a workflow I can trust. The workflow I got nailed down is that I would talk with the godfather cloud AI about a feature, say something like full stack notifications for a web app. Cloud AI will read through and create the task toml file and it would kick off the lean-loop script. The local AI would do the bulk of the work autonomously leading to a 5x cloud saving expenditure according to Claude code. The savings scale linearly with feature and task length.
 
 ## Quick start
 
@@ -94,6 +94,8 @@ lean-loop --help
    config, then edit it: point `[runner]` at your test command and add
    `[[tasks]]` blocks. See [`examples/`](examples/) for samples.
 4. `lean-loop -c leanfile.toml`
+5. (Optional) Set up the MCP server for file-aware queries against your local
+   LLM — see [lean-mcp server](#lean-mcp-server) below.
 
 ## Config
 
@@ -108,6 +110,141 @@ Two files, deep-merged at load time:
 
 Static config discovery: `--global-config` flag -> `$LEANLOOP_CONFIG` env var ->
 `config.toml` next to `leanloop.py` -> `~/.config/lean-loop/config.toml`.
+
+## lean-mcp server
+
+An optional MCP (Model Context Protocol) server ships at `lean-mcp/server.py`.
+It exposes a single tool — **`ask_about`** — that routes questions about your
+source files through the same local LLM that `lean-loop` uses. This lets you
+interrogate your codebase from any MCP-compatible client (DeepSeek TUI, Claude
+Desktop, etc.) without running a separate agent CLI.
+
+### How it works
+
+``` text
+MCP client                  lean-mcp/server.py             local LLM
+  │                              │                              │
+  │  ask_about("what does        │                              │
+  │   this function do?",        │                              │
+  │   ["src/auth.py"])           │                              │
+  │ ─────────────────────────►   │                              │
+  │                              │  read src/auth.py            │
+  │                              │  POST /v1/chat/completions   │
+  │                              │ ──────────────────────────►  │
+  │                              │ ◄──────────────────────────  │
+  │ ◄─────────────────────────   │                              │
+  │  {"file":"src/auth.py",      │                              │
+  │   "status":"ok",             │                              │
+  │   "response":"..."}          │                              │
+```
+
+- Reads each file from disk, sends `question + file content` to the LLM one at
+  a time (serial — respects your GPU's capacity).
+- Skips files exceeding the char limit and reports them as skipped.
+- Returns structured JSON with per-file results and a summary.
+
+### Install
+
+The server needs the `mcp` Python package (its only external dependency):
+
+``` bash
+cd /path/to/lean-loop
+python3 -m venv lean-mcp/.venv
+lean-mcp/.venv/bin/pip install mcp
+```
+
+Or use the pinned list:
+
+``` bash
+lean-mcp/.venv/bin/pip install -r lean-mcp/requirements.txt
+```
+
+### Register with DeepSeek TUI
+
+``` bash
+deepseek mcp add lean-ask \
+  --command /path/to/lean-loop/lean-mcp/.venv/bin/python3 \
+  --arg /path/to/lean-loop/lean-mcp/server.py
+deepseek mcp validate    # confirm it's alive
+deepseek mcp tools       # should show ask_about
+```
+
+### Configuration
+
+The server reuses `config.toml` from `lean-loop`. The `[lean]` section provides
+the LLM endpoint (`base_url`, `model`, `api_key`). An optional `[mcp]` section
+controls the per-file character limit:
+
+``` toml
+[mcp]
+max_file_chars = 32000   # default; files over this are reported as skipped
+```
+
+### Usage
+
+The tool accepts three parameters:
+
+- **`question`** (required) — the question to ask about each file.
+- **`files`** (required) — list of file paths (absolute, or relative to the
+  project root).
+- **`think`** (optional, default `false`) — enable the model's chain-of-thought
+  reasoning. Turn this on for architecture reviews, security analysis, or
+  ambiguous questions; leave it off for fast direct answers.
+
+``` python
+# Fast, direct answers (no reasoning overhead)
+ask_about("What does this module export?", ["src/auth.py", "src/handler.py"])
+
+# With reasoning for deeper analysis
+ask_about("Is this implementation thread-safe?", ["src/scheduler.py"], think=True)
+```
+
+The response is a JSON object with per-file results and a summary:
+
+``` json
+{
+  "results": [
+    {
+      "file": "src/auth.py",
+      "status": "ok",
+      "response": "This module handles JWT token verification...",
+      "input_chars": 4231,
+      "output_chars": 980
+    },
+    {
+      "file": "src/huge.py",
+      "status": "skipped",
+      "reason": "file exceeds 32000-char limit (45123 chars)"
+    },
+    {
+      "file": "src/gone.py",
+      "status": "error",
+      "reason": "cannot read file: /abs/path/src/gone.py"
+    }
+  ],
+  "summary": {
+    "total": 3,
+    "ok": 1,
+    "skipped": 1,
+    "error": 1,
+    "model": "Qwen3.6-35B-A3B-UD-Q4_K_M.gguf"
+  }
+}
+```
+
+### Chat template
+
+If your local model uses a chat template that supports an `enable_thinking` flag
+(e.g. Qwen3), you can set it here. The server passes
+`"chat_template_kwargs": {"enable_thinking": true/false}` on every request.
+The Qwen3 template is bundled at `lean-mcp/chat_template.txt` for reference.
+
+### Requirements
+
+- Python 3.11+
+- `pip install mcp` (or use the venv setup above)
+- A running LLM server on `http://127.0.0.1:8080/v1` (or whichever `base_url` is
+  configured in `config.toml`)
 
 ## LeanerFiles (`leaners/`)
 
