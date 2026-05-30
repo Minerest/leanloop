@@ -200,10 +200,7 @@ def _lean_env(config: dict) -> dict:
 # Token accounting (per task + grand total). Chars are accumulated at each
 # lean_call site so both the generating call and any fix-loop iterations
 # are credited to the active task. Tokens are estimated as chars/4 — the
-# industry-standard rule of thumb for BPE-style tokenizers. Cloud equivalent
-# is local_input_tokens * cloud_multiplier (default 5×), representing the
-# extra reads / agent fan-out a frontier cloud model would do for the same
-# work; tune via [defaults] cloud_multiplier in your leanfile.
+# industry-standard rule of thumb for BPE-style tokenizers.
 _TOKEN_STATS: dict = {
     "task_in": 0, "task_out": 0, "task_calls": 0,
     "total_in": 0, "total_out": 0, "total_calls": 0,
@@ -233,7 +230,7 @@ def _fmt_k(n_tokens: float) -> str:
     return f"{n_tokens / 1000:.1f}k"
 
 
-def _print_token_summary(label: str, multiplier: float) -> None:
+def _print_token_summary(label: str) -> None:
     """One-line token summary for the current scope (task or grand total)."""
     is_total = label.startswith("grand")
     chars_in = _TOKEN_STATS["total_in"] if is_total else _TOKEN_STATS["task_in"]
@@ -244,15 +241,10 @@ def _print_token_summary(label: str, multiplier: float) -> None:
 
     tok_in = chars_in / 4
     tok_out = chars_out / 4
-    cloud_equiv = tok_in * multiplier
-    saved = max(0.0, cloud_equiv - tok_in)
-    ratio = (cloud_equiv / tok_in) if tok_in > 0 else 0.0
 
     print(
-        f"  [tok] {label}: local ~{_fmt_k(tok_in)} in / ~{_fmt_k(tok_out)} out"
-        f" · cloud-equiv ~{_fmt_k(cloud_equiv)}"
-        f" · saved ~{_fmt_k(saved)} (~{ratio:.1f}×) "
-        f"[{n_calls} call{'s' if n_calls != 1 else ''}]"
+        f"  [tok] {label}: ~{_fmt_k(tok_in)} in / ~{_fmt_k(tok_out)} out"
+        f" [{n_calls} call{'s' if n_calls != 1 else ''}]"
     )
 
 
@@ -271,6 +263,14 @@ def lean_call(prompt: str, config: dict) -> str | None:
     lean_bin = lcfg.get("binary", LEAN_DEFAULT_BINARY)
     timeout = lcfg.get("timeout", 600)
     env = _lean_env(config)
+
+    # Prepend global_message from [defaults] if set — applied to every
+    # model call (task prompt, error summary, fix prompt). The constraint
+    # (MCP tool-use requirement, etc.) lives in the toml config alongside
+    # QWEN.md which still carries per-project conventions as a system prompt.
+    _global = config.get("defaults", {}).get("global_message", "").strip()
+    if _global:
+        prompt = f"{_global}\n\n{prompt}"
 
     for attempt in range(1, LEAN_MAX_EMPTY_RETRIES + 1):
         try:
@@ -542,7 +542,7 @@ def compress_traceback(tb_text: str, cfg: dict | None = None) -> str:
 # Test runner
 # ===============================================================================
 
-def run_tests(config: dict) -> tuple[int, str]:
+def run_tests(config: dict, cwd: str | None = None) -> tuple[int, str]:
     """Run the test command from config. Returns (returncode, output).
 
     Config:
@@ -552,6 +552,10 @@ def run_tests(config: dict) -> tuple[int, str]:
       timeout = 30                      # optional, seconds
       shell = false                     # optional, run via shell (default false)
       env = { FOO = "bar" }             # optional, extra env vars
+
+    Args:
+      cwd: Override working directory. Falls back to config's
+           defaults.project_root when not set.
     """
     runner = config["runner"]
     cmd = runner["command"]
@@ -571,6 +575,9 @@ def run_tests(config: dict) -> tuple[int, str]:
         full_cmd = [cmd] + list(args)
         printable = " ".join(full_cmd)
 
+    if cwd is None:
+        cwd = config.get("defaults", {}).get("project_root", ".")
+
     print(f"  $ {printable}")
     try:
         result = subprocess.run(
@@ -578,7 +585,7 @@ def run_tests(config: dict) -> tuple[int, str]:
             shell=use_shell,
             capture_output=True, text=True,
             timeout=runner.get("timeout", 30),
-            cwd=config.get("defaults", {}).get("project_root", "."),
+            cwd=cwd,
             env=env,
         )
         return result.returncode, result.stdout + "\n" + result.stderr
@@ -877,14 +884,11 @@ def process_task(task: dict, cfg: dict) -> bool:
 
     # -- Fresh wrapper call (handles file writes natively) -----------------
 
-    # Global message propagated to every task (set in [defaults] global_message).
-    # Mechanical conventions — response shapes, import rules, naming patterns —
-    # can be written once here instead of duplicated in every task prompt.
-    global_msg = cfg.get("defaults", {}).get("global_message", "").strip()
+    # Global message is injected by lean_call() via [defaults] global_message
+    # in the toml config — no longer handled here.
 
     wrapper_prompt = (
-        (f"{global_msg}\n\n" if global_msg else "")
-        + f"Task: {task_prompt}\n\n"
+        f"Task: {task_prompt}\n\n"
         f"Project files:\n{context}\n\n"
         f"Current git diff:\n```diff\n{git_diff_short(None, project_root)}\n```"
     )
@@ -897,17 +901,22 @@ def process_task(task: dict, cfg: dict) -> bool:
     # -- Run tests ------------------------------------------------------
     eff_cfg = _task_cfg(cfg, task)
     if task.get("skip_tests", False):
-        # Per-task opt-out: don't run the full test runner between the
-        # model call and the after-commands. Use this for tasks where
-        # the held-out check lives entirely in `after` (e.g. convention
-        # probes with an AST oracle), or when the runner's full-suite
-        # sweep would be noise. The fix loop is also skipped, since it's
-        # gated on test failure. After-commands still run.
         print(f"  [skip] tests skipped (skip_tests=true)")
         passed = True
     else:
-        print(f"  Running tests...", flush=True)
-        retcode, test_output = run_tests(eff_cfg)
+        test_files = task.get("test_files")
+        if test_files:
+            # Per-task scoping — run only the listed test files instead of
+            # the global runner.args. Keeps feedback fast and eliminates
+            # importorskip noise from unrelated features.
+            task_cfg = dict(eff_cfg)
+            task_cfg["runner"] = dict(eff_cfg.get("runner", {}))
+            task_cfg["runner"]["args"] = list(test_files)
+            print(f"  Running tests ({len(test_files)} file(s))...", flush=True)
+            retcode, test_output = run_tests(task_cfg)
+        else:
+            print(f"  Running tests...", flush=True)
+            retcode, test_output = run_tests(eff_cfg)
         if retcode == 0:
             print(f"  [ok] All tests pass")
             passed = True
@@ -917,8 +926,7 @@ def process_task(task: dict, cfg: dict) -> bool:
 
     if not passed:
         if cfg.get("defaults", {}).get("log_token_savings", True):
-            multiplier = cfg.get("defaults", {}).get("cloud_multiplier", 5.0)
-            _print_token_summary(f"task tokens ({task.get('name', '?')}, FAILED)", multiplier)
+            _print_token_summary(f"task tokens ({task.get('name', '?')}, FAILED)")
         return False
 
     # -- Post-task hooks -----------------------------------------------
@@ -930,8 +938,7 @@ def process_task(task: dict, cfg: dict) -> bool:
             return False
 
     if cfg.get("defaults", {}).get("log_token_savings", True):
-        multiplier = cfg.get("defaults", {}).get("cloud_multiplier", 5.0)
-        _print_token_summary(f"task tokens ({task.get('name', '?')})", multiplier)
+        _print_token_summary(f"task tokens ({task.get('name', '?')})")
     _TOKEN_STATS["n_tasks"] += 1
     return True
 
@@ -1194,9 +1201,8 @@ def _run_workload(cfg: dict, args) -> bool:
     print("[ok] All tasks completed")
 
     if cfg.get("defaults", {}).get("log_token_savings", True):
-        multiplier = cfg.get("defaults", {}).get("cloud_multiplier", 5.0)
         n = _TOKEN_STATS["n_tasks"]
-        _print_token_summary(f"grand total across {n} task{'s' if n != 1 else ''}", multiplier)
+        _print_token_summary(f"grand total across {n} task{'s' if n != 1 else ''}")
     return True
 
 
@@ -1302,11 +1308,9 @@ def main() -> int:
             _TOKEN_STATS["total_out"] = cross_out
             _TOKEN_STATS["total_calls"] = cross_calls
             _TOKEN_STATS["n_tasks"] = cross_tasks
-            multiplier = last_cfg.get("defaults", {}).get("cloud_multiplier", 5.0)
             _print_token_summary(
                 f"grand total across {len(config_paths)} configs "
                 f"({cross_tasks} task{'s' if cross_tasks != 1 else ''})",
-                multiplier,
             )
 
     return 0

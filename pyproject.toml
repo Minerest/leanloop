@@ -25,12 +25,13 @@ classifiers = [
 
 [project.scripts]
 lean-loop = "leanloop:main"
+autolean = "autolean:main"
 
 [project.optional-dependencies]
 dev = ["pytest>=7", "httpx"]
 
 [tool.setuptools]
-py-modules = ["leanloop"]
+py-modules = ["leanloop", "autolean"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
