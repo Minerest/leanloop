@@ -113,138 +113,91 @@ Static config discovery: `--global-config` flag -> `$LEANLOOP_CONFIG` env var ->
 
 ## lean-mcp server
 
-An optional MCP (Model Context Protocol) server ships at `lean-mcp/server.py`.
-It exposes a single tool — **`ask_about`** — that routes questions about your
-source files through the same local LLM that `lean-loop` uses. This lets you
-interrogate your codebase from any MCP-compatible client (DeepSeek TUI, Claude
-Desktop, etc.) without running a separate agent CLI.
+An MCP (Model Context Protocol) server ships at `lean-mcp/server.py`. It
+provides **five code-intelligence tools** that the agent CLI can call during
+the fix loop — regex search, test execution, and structured symbol lookup. No
+LLM calls; the server uses ripgrep, AST parsing, and regex to answer queries
+directly.
 
-### How it works
+### Startup: AST index
 
-``` text
-MCP client                  lean-mcp/server.py             local LLM
-  │                              │                              │
-  │  ask_about("what does        │                              │
-  │   this function do?",        │                              │
-  │   ["src/auth.py"])           │                              │
-  │ ─────────────────────────►   │                              │
-  │                              │  read src/auth.py            │
-  │                              │  POST /v1/chat/completions   │
-  │                              │ ──────────────────────────►  │
-  │                              │ ◄──────────────────────────  │
-  │ ◄─────────────────────────   │                              │
-  │  {"file":"src/auth.py",      │                              │
-  │   "status":"ok",             │                              │
-  │   "response":"..."}          │                              │
-```
+At startup the server crawls the project root and builds an in-memory symbol
+index. Python files are parsed with `ast` (methods get `type: "method"`,
+module-level functions get `type: "function"`, classes get `type: "class"`).
+JavaScript/TypeScript files are indexed with compiled regex patterns (`function`,
+`class`, `const`, `let`). Files matched by `.gitignore` are skipped via
+`git ls-files`; when not in a git repo the server falls back to a directory
+walk that skips `venv/`, `node_modules/`, `__pycache__/`, and similar.
 
-- Reads each file from disk, sends `question + file content` to the LLM one at
-  a time (serial — respects your GPU's capacity).
-- Skips files exceeding the char limit and reports them as skipped.
-- Returns structured JSON with per-file results and a summary.
+A 125-file Python project indexes in ~360ms on a warm disk. The index is held in
+memory for the lifetime of the server process — every `find_symbol` call is a
+dict lookup, no subprocess.
+
+### Tools
+
+| Tool | What it does |
+|------|-------------|
+| **`run_tests`** | Execute a test command (pytest, `go test`, `npm test`, ...) and return structured pass/fail results. On success, compresses output to the summary line. On failure, returns the last 100 lines. |
+| **`rg_search`** | Full-text regex search via ripgrep. Returns up to 50 matches with file/line/text. The enriched summary includes file distribution, extension breakdown, and symbol names from the in-memory index. |
+| **`rg_files`** | Filename-only ripgrep search. Returns file paths with per-file match counts, sorted by density. Use before `rg_context` to narrow the scope. |
+| **`rg_context`** | Regex search with surrounding context lines. Each match group carries `start_line`, `end_line`, `match_line`, and a structured context array. Use to read the code around a match. |
+| **`find_symbol`** | In-memory index lookup — no subprocess, O(1) dict access. Returns `{symbols: {name: {file, line, type, language}}}`. Exact match by default; `fuzzy=true` matches prefix. Supports Python and JavaScript/TypeScript. |
 
 ### Install
-
-The server needs the `mcp` Python package (its only external dependency):
 
 ``` bash
 cd /path/to/lean-loop
 python3 -m venv lean-mcp/.venv
 lean-mcp/.venv/bin/pip install mcp
-```
-
-Or use the pinned list:
-
-``` bash
+# or:
 lean-mcp/.venv/bin/pip install -r lean-mcp/requirements.txt
 ```
 
-### Register with DeepSeek TUI
+### Register with Qwen Code CLI
 
-``` bash
-deepseek mcp add lean-ask \
-  --command /path/to/lean-loop/lean-mcp/.venv/bin/python3 \
-  --arg /path/to/lean-loop/lean-mcp/server.py
-deepseek mcp validate    # confirm it's alive
-deepseek mcp tools       # should show ask_about
-```
-
-### Configuration
-
-The server reuses `config.toml` from `lean-loop`. The `[lean]` section provides
-the LLM endpoint (`base_url`, `model`, `api_key`). An optional `[mcp]` section
-controls the per-file character limit:
-
-``` toml
-[mcp]
-max_file_chars = 32000   # default; files over this are reported as skipped
-```
-
-### Usage
-
-The tool accepts three parameters:
-
-- **`question`** (required) — the question to ask about each file.
-- **`files`** (required) — list of file paths (absolute, or relative to the
-  project root).
-- **`think`** (optional, default `false`) — enable the model's chain-of-thought
-  reasoning. Turn this on for architecture reviews, security analysis, or
-  ambiguous questions; leave it off for fast direct answers.
-
-``` python
-# Fast, direct answers (no reasoning overhead)
-ask_about("What does this module export?", ["src/auth.py", "src/handler.py"])
-
-# With reasoning for deeper analysis
-ask_about("Is this implementation thread-safe?", ["src/scheduler.py"], think=True)
-```
-
-The response is a JSON object with per-file results and a summary:
+Add a `mcpServers` entry to Qwen's config (`.qwen/mcp.json` or your
+project-level MCP config):
 
 ``` json
 {
-  "results": [
-    {
-      "file": "src/auth.py",
-      "status": "ok",
-      "response": "This module handles JWT token verification...",
-      "input_chars": 4231,
-      "output_chars": 980
-    },
-    {
-      "file": "src/huge.py",
-      "status": "skipped",
-      "reason": "file exceeds 32000-char limit (45123 chars)"
-    },
-    {
-      "file": "src/gone.py",
-      "status": "error",
-      "reason": "cannot read file: /abs/path/src/gone.py"
+  "mcpServers": {
+    "lean-mcp": {
+      "command": "/path/to/lean-loop/lean-mcp/.venv/bin/python3",
+      "args": ["/path/to/lean-loop/lean-mcp/server.py"]
     }
-  ],
-  "summary": {
-    "total": 3,
-    "ok": 1,
-    "skipped": 1,
-    "error": 1,
-    "model": "Qwen3.6-35B-A3B-UD-Q4_K_M.gguf"
   }
 }
 ```
 
-### Chat template
+The server inherits the working directory from the Qwen CLI process, which
+is the project root. That means ripgrep searches, test runs, and AST indexing
+all target the right project automatically.
 
-If your local model uses a chat template that supports an `enable_thinking` flag
-(e.g. Qwen3), you can set it here. The server passes
-`"chat_template_kwargs": {"enable_thinking": true/false}` on every request.
-The Qwen3 template is bundled at `lean-mcp/chat_template.txt` for reference.
+### Configuration
+
+Reuses `config.toml` from lean-loop. The `[mcp]` section controls:
+
+``` toml
+[mcp]
+rg_max_results = 50     # max matches per rg search
+# project_root = "..."  # optional: absolute path or relative to config.toml
+                        # Resolution: $LEAN_PROJECT_ROOT → this key → cwd()
+max_file_chars = 32000  # legacy per-file char limit
+```
+
+### Project root resolution
+
+The server determines where to search and run tests in this order:
+
+1. `$LEAN_PROJECT_ROOT` environment variable (absolute path)
+2. `[mcp] project_root` in `config.toml` (relative paths resolved against the config file's directory)
+3. Current working directory (inherited from the parent Qwen CLI process)
 
 ### Requirements
 
 - Python 3.11+
-- `pip install mcp` (or use the venv setup above)
-- A running LLM server on `http://127.0.0.1:8080/v1` (or whichever `base_url` is
-  configured in `config.toml`)
+- `pip install mcp` (only external dependency)
+- `ripgrep` (`rg`) on `PATH`
 
 ## LeanerFiles (`leaners/`)
 

@@ -22,6 +22,12 @@ max_wait  = 60
 
 [mcp]
 max_file_chars = 32000              # per-file char limit for lean-mcp's ask_about tool
+# project_root: optional override for the LeanLoop MCP server's repo root.
+#   Resolution order: $LEAN_PROJECT_ROOT env var → this key → cwd().
+#   Relative paths are resolved against the directory containing config.toml.
+#   Most setups don't need this — the server inherits cwd from Qwen CLI.
+# project_root = "/absolute/path/to/project"
+
 
 [defaults]
 source_window         = 30
@@ -39,11 +45,13 @@ global_message = """
 This project uses a lean-mcp MCP server for repository search and test execution.
 You MUST use the following MCP tools for code understanding and verification:
 
-- rg_search(query, path='.', file_glob?, case_sensitive?) — Regex search across files. Returns {matches: [{file, line, text}]}. Capped at 50 results.
+- find_symbol(name, path='.', fuzzy=false) — O(1) in-memory lookup of where a function/class/constant is *defined*. Returns {symbols: {name: {file, line, type, language}}}. Prefer this over rg_search when you want to find a definition (not usages). Use fuzzy=true for prefix matching.
+- rg_search(query, path='.', file_glob?, case_sensitive?) — Regex search across files. Returns {matches: [{file, line, text}]}. Capped at 50 results. Use for finding usages, patterns, or anything find_symbol can't answer.
 - rg_files(query, path='.') — Filenames only. Returns {files: [...]}.
 - rg_context(query, path='.', before=5, after=10) — Matches with surrounding context. Returns {matches: [{file, start_line, context: [...]}]}.
 - run_tests(command, cwd?, timeout=300) — Execute test commands with structured results.
 
+Prefer find_symbol for "where is X defined?" — it's faster and returns structured type info.
 Use rg_search/rg_context for code understanding instead of reading entire files.
 Use rg_files to locate files before inspecting them.
 Use run_tests to verify changes instead of guessing.

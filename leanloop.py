@@ -24,6 +24,7 @@ from __future__ import annotations
 import argparse
 import os
 import re
+import signal
 import subprocess
 import sys
 import time
@@ -146,6 +147,100 @@ def ensure_server(health_url: str, max_wait: int) -> bool:
     if health_check(health_url):
         return True
     return wait_for_server(health_url, max_wait)
+
+
+# ---------------------------------------------------------------------------
+# PID-file based stale-server cleanup
+# ---------------------------------------------------------------------------
+
+_LEAN_MCP_PID_FILE = "/tmp/lean-mcp.pid"
+
+
+def _cleanup_stale_servers() -> int:
+    """Kill any orphaned lean-mcp servers found via the PID file.
+
+    An orphaned server is one whose parent process no longer exists
+    (Qwen exited but the server didn't notice). Returns the number of
+    servers killed.
+
+    Leaves manually-started servers alone — if the parent is still alive,
+    the server is assumed to be intentionally running.
+    """
+    if not os.path.exists(_LEAN_MCP_PID_FILE):
+        return 0
+
+    try:
+        with open(_LEAN_MCP_PID_FILE) as f:
+            pid_str = f.read().strip()
+        pid = int(pid_str)
+    except (OSError, ValueError):
+        # Stale/unreadable PID file — remove it.
+        try:
+            os.remove(_LEAN_MCP_PID_FILE)
+        except OSError:
+            pass
+        return 0
+
+    # Check if the process still exists.
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        # Process is gone — just clean up the stale PID file.
+        try:
+            os.remove(_LEAN_MCP_PID_FILE)
+        except OSError:
+            pass
+        return 0
+
+    # Process exists. Check if it's orphaned (parent is init, PID 1).
+    # We use `ps -o ppid= -p <pid>` which works on both Linux and macOS.
+    try:
+        result = subprocess.run(
+            ["ps", "-o", "ppid=", "-p", str(pid)],
+            capture_output=True, text=True, timeout=5,
+        )
+        ppid_str = result.stdout.strip()
+        ppid = int(ppid_str) if ppid_str else 0
+    except (subprocess.TimeoutExpired, ValueError, OSError):
+        ppid = 0
+
+    if ppid == 0:
+        # Can't determine parent — be conservative, don't kill.
+        return 0
+
+    # Check if the parent is still alive.
+    try:
+        os.kill(ppid, 0)
+    except OSError:
+        # Parent is dead — this server is orphaned. Kill it.
+        print(f"[mcp] killing orphaned server (pid={pid}, ppid={ppid} dead)")
+        _kill_process(pid)
+        try:
+            os.remove(_LEAN_MCP_PID_FILE)
+        except OSError:
+            pass
+        return 1
+
+    # Parent is alive — server is intentionally running (manual or another
+    # Qwen session). Leave it alone.
+    return 0
+
+
+def _kill_process(pid: int) -> None:
+    """Kill a process gracefully (SIGTERM), then forcefully (SIGKILL)."""
+    try:
+        os.kill(pid, signal.SIGTERM)
+        # Wait up to 2 seconds for graceful shutdown.
+        for _ in range(20):
+            time.sleep(0.1)
+            try:
+                os.kill(pid, 0)
+            except OSError:
+                return  # Process exited.
+        # Force kill.
+        os.kill(pid, signal.SIGKILL)
+    except OSError:
+        pass  # Process already gone.
 
 
 # ===============================================================================
@@ -1255,6 +1350,10 @@ def main() -> int:
 
     if args.set_leaner:
         return _set_leaner(args.set_leaner)
+
+    # Kill any orphaned lean-mcp servers left over from crashed Qwen sessions.
+    # A fresh server will be spawned by Qwen when we make our first lean_call().
+    _cleanup_stale_servers()
 
     config_paths = args.config
     multi = len(config_paths) > 1

@@ -1,0 +1,64 @@
+# lean-mcp architecture reference
+
+A local code-intelligence MCP server for LeanLoop. Runs as a persistent
+stdio process beside Qwen CLI (or any MCP client). Five tools.
+
+## Startup
+
+`main()` resolves the project root (env → config → cwd), then runs a full
+AST + regex crawl of the project. Index lives in two module-level dicts:
+
+  `_SYMBOL_INDEX`   {name: [{file, line, type, language}]}
+  `_INDEX_BY_FILE`  {file_path: [name, ...]}
+
+Git-aware: `git ls-files --cached --others --exclude-standard` determines
+which files to scan. Falls back to a directory walk with common skip dirs
+when not in a git repo.
+
+Python: `ast.parse()` — methods inside classes get type="method",
+module-level defs get type="function", classes get type="class".
+JavaScript/TypeScript: four compiled regex patterns for function,
+class, const, and let definitions.
+
+## Tools
+
+### run_tests(command, cwd?, timeout=300)
+Runs a shell command and returns structured pass/fail results.
+On success: compressed to the summary line ("3 passed in 0.12s").
+On failure: last 100 lines of stdout + stderr.
+
+### rg_search(query, path=".", file_glob?, case_sensitive=false)
+Full-text regex search via ripgrep. Returns up to 50 matches with
+file/line/text. Enriched summary includes file distribution, extension
+breakdown, and symbol names from the in-memory index.
+
+### rg_files(query, path=".")
+Filenames-only ripgrep search. Returns file paths with match counts,
+sorted by density. Use before rg_context to narrow the scope.
+
+### rg_context(query, path=".", before=5, after=10)
+Regex search with surrounding context lines. Each match group includes
+start_line, end_line, match_line, and a structured context array.
+Used for reading code around a match.
+
+### find_symbol(name, path=".", fuzzy=false)
+In-memory index lookup — no subprocess, no regex. O(1) dict access.
+Exact match by default; fuzzy=true matches prefix (name.startswith).
+Optional path parameter filters by file path prefix.
+Returns {symbols: {name: {file, line, type, language}}}.
+Multiple definitions of the same name → array.
+
+## Config
+
+Reuses lean-loop's config.toml:
+
+  [mcp]
+  rg_max_results = 50     # max matches per rg search
+  project_root = "..."    # optional absolute/relative override
+  max_file_chars = 32000  # per-file char limit (legacy)
+
+Project root resolution order: $LEAN_PROJECT_ROOT env → [mcp] project_root → cwd().
+
+## Dependencies
+
+Python 3.11+, `mcp` package (FastMCP), ripgrep on PATH.

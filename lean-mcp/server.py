@@ -14,17 +14,26 @@ Tools:
   rg_context(query, path, before, after)
     Regex search with surrounding context lines.
 
+  find_symbol(name, path, fuzzy)
+    Find where a symbol is defined (function, class, constant, variable).
+    Supports Python and JavaScript/TypeScript.
+
 Config reused from lean-loop's config.toml:
-  [mcp]  rg_max_results (default 50)
+  [mcp]  rg_max_results   (default 50)
+  [mcp]  project_root     (optional — absolute path or relative to config.toml)
+  [mcp]  max_file_chars   (default 32000)
 """
 
 from __future__ import annotations
 
 import ast
+import atexit
 import json
+import os
 import re
 import subprocess
 import sys
+import threading
 import time
 import tomllib
 from pathlib import Path
@@ -47,9 +56,16 @@ def _load_toml(path: Path) -> dict:
 
 
 def _find_config() -> dict:
-    """Find and return the merged static config (ignores per-project overrides)."""
+    """Find and return the merged static config (ignores per-project overrides).
+
+    Sets the module-level ``CONFIG_DIR`` to the directory containing the
+    loaded config file so relative paths (e.g. ``project_root``) resolve
+    correctly.
+    """
+    global CONFIG_DIR
     for candidate in STATIC_CONFIG_DEFAULTS:
         if candidate.exists():
+            CONFIG_DIR = candidate.parent
             return _load_toml(candidate)
     print(
         "lean-mcp: no config.toml found",
@@ -58,6 +74,7 @@ def _find_config() -> dict:
     sys.exit(1)
 
 
+CONFIG_DIR: Path | None = None
 CONFIG = _find_config()
 
 MCP_CFG = CONFIG.get("mcp", {})
@@ -66,6 +83,54 @@ RG_MAX_RESULTS = MCP_CFG.get("rg_max_results", 50)
 
 _LOG_FILE = "/tmp/lean-mcp.log"
 _LOG_FILE_READY = False
+
+# ---------------------------------------------------------------------------
+# PID file — leanloop.py uses this to detect and kill stale servers
+# ---------------------------------------------------------------------------
+
+_PID_FILE = "/tmp/lean-mcp.pid"
+
+
+def _write_pid_file() -> None:
+    """Write this process's PID to the PID file. Register atexit cleanup."""
+    try:
+        with open(_PID_FILE, "w") as f:
+            f.write(str(os.getpid()))
+    except OSError:
+        return
+    atexit.register(_cleanup_pid_file)
+
+
+def _cleanup_pid_file() -> None:
+    """Remove the PID file only if it still belongs to this process."""
+    try:
+        if os.path.exists(_PID_FILE):
+            with open(_PID_FILE) as f:
+                if f.read().strip() == str(os.getpid()):
+                    os.remove(_PID_FILE)
+    except (OSError, ValueError):
+        pass
+
+
+def _parent_monitor() -> None:
+    """Daemon thread: exit the process if the parent (Qwen) dies.
+
+    Without this, the server sits in ``select()`` on stdin forever after
+    Qwen exits, becoming an orphan that still holds the control port.
+    """
+    ppid = os.getppid()
+    if ppid == 1:
+        # Already orphaned at startup — shouldn't happen, but exit cleanly.
+        _log("lifecycle", event="already_orphaned", ppid=ppid)
+        os._exit(0)
+
+    while True:
+        time.sleep(5)
+        try:
+            os.kill(ppid, 0)  # signal 0 = existence check, no signal delivered
+        except OSError:
+            _log("lifecycle", event="parent_died", ppid=ppid)
+            os._exit(0)
 
 
 # Test the log file is writable at import time
@@ -152,16 +217,20 @@ server = FastMCP(
     "lean-mcp",
     instructions=(
         "lean-mcp provides local code intelligence tools for autonomous coding agents. "
-        "It has two tool families: (1) ripgrep-powered code search (rg_search, rg_files, "
+        "It has three tool families: (1) ripgrep-powered code search (rg_search, rg_files, "
         "rg_context) for finding symbols, patterns, definitions, usages, and understanding "
-        "code structure across the repository; and (2) a test runner (run_tests) for "
-        "executing test commands and getting structured pass/fail results. "
+        "code structure across the repository; (2) a symbol finder (find_symbol) that "
+        "returns structured definition locations with type classification for Python and "
+        "JavaScript/TypeScript; and (3) a test runner (run_tests) for executing test "
+        "commands and getting structured pass/fail results. "
         "Use code search tools when you need to find where a function is defined, where "
         "a class is used, how an API is called, or what files reference a particular "
-        "pattern. Use run_tests after making code changes to verify correctness. "
+        "pattern. Use find_symbol to locate definitions specifically (not usages). "
+        "Use run_tests after making code changes to verify correctness. "
         "Prefer rg_files for 'which files contain X?' questions, rg_search for "
-        "'show me every occurrence of X', and rg_context when you need to read the "
-        "surrounding code around each match to understand how X is used."
+        "'show me every occurrence of X', rg_context when you need to read the "
+        "surrounding code around each match, and find_symbol when you need to know "
+        "where something is defined and what type it is."
     ),
 )
 
@@ -204,12 +273,7 @@ def run_tests(
     """
     _log("run_tests", command=command, cwd=cwd or "(auto)", timeout=timeout)
     if not cwd:
-        # Default to project root
-        script_dir = Path(__file__).resolve().parent
-        if script_dir.name == "lean-mcp":
-            cwd = str(script_dir.parent)
-        else:
-            cwd = str(Path.cwd())
+        cwd = str(_get_repo_root())
 
     try:
         result = subprocess.run(
@@ -329,37 +393,35 @@ def _normalize_rg_path(raw: str) -> str:
     return raw
 
 
-# Maximum unique files to scan for symbol extraction (per call)
-_MAX_SYMBOL_FILES = 10
+# ---------------------------------------------------------------------------
+# Symbol index — held in memory, populated at startup or via control port
+# ---------------------------------------------------------------------------
+
+_SYMBOL_INDEX: dict[str, list[dict]] = {}
+_INDEX_BY_FILE: dict[str, list[str]] = {}
+
+try:
+    from . import indexer
+except ImportError:
+    import indexer  # running directly (python server.py)
 
 
-def _extract_symbols(file_path: str, repo_root: Path) -> list[str]:
-    """Extract function and class names from a Python file using AST.
+def _build_symbol_index(repo_root: Path) -> None:
+    """Run the indexer against *repo_root* and store results in module dicts."""
+    global _SYMBOL_INDEX, _INDEX_BY_FILE
 
-    Only scans ``.py`` files. Returns up to 15 symbols per file.
-    """
-    if not file_path.endswith(".py"):
-        return []
+    result = indexer.build_index(repo_root)
+    _SYMBOL_INDEX = result["symbols"]
+    _INDEX_BY_FILE = result["by_file"]
 
-    full_path = repo_root / file_path
-    if not full_path.is_file():
-        return []
-
-    try:
-        with open(full_path, "r", encoding="utf-8", errors="replace") as f:
-            tree = ast.parse(f.read())
-    except (SyntaxError, OSError):
-        return []
-
-    symbols: list[str] = []
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            symbols.append(f"def {node.name}")
-        elif isinstance(node, ast.ClassDef):
-            symbols.append(f"class {node.name}")
-        if len(symbols) >= 15:
-            break
-    return symbols
+    _log(
+        "build_index",
+        py_files=result["stats"]["py_files"],
+        js_files=result["stats"]["js_files"],
+        symbols=result["stats"]["symbols"],
+        unique_names=result["stats"]["unique_names"],
+        elapsed_ms=result["stats"]["elapsed_ms"],
+    )
 
 
 def _build_summary(
@@ -368,8 +430,8 @@ def _build_summary(
 ) -> dict:
     """Build an enriched summary from a list of rg matches.
 
-    Returns a dict with top-level context: files affected, symbol map,
-    and match distribution.
+    Reads symbol names from the in-memory ``_INDEX_BY_FILE`` instead of
+    re-parsing files on every call.
     """
     files_seen: dict[str, int] = {}
     for m in matches:
@@ -382,11 +444,11 @@ def _build_summary(
         ext = Path(f).suffix.lstrip(".") or "(none)"
         extensions[ext] = extensions.get(ext, 0) + 1
 
-    # Extract symbols from N most-hit files
+    # Symbols from the in-memory index (top 10 most-hit files)
     sorted_files = sorted(files_seen, key=files_seen.get, reverse=True)
     symbol_map: dict[str, list[str]] = {}
-    for f in sorted_files[:_MAX_SYMBOL_FILES]:
-        syms = _extract_symbols(f, repo_root)
+    for f in sorted_files[:10]:
+        syms = _INDEX_BY_FILE.get(f)
         if syms:
             symbol_map[f] = syms
 
@@ -400,10 +462,28 @@ def _build_summary(
 
 
 def _get_repo_root() -> Path:
-    """Return the project root directory (parent of ``lean-mcp/``)."""
-    script_dir = Path(__file__).resolve().parent
-    if script_dir.name == "lean-mcp":
-        return script_dir.parent
+    """Return the project root directory for ripgrep searches and test runs.
+
+    Resolution order (first match wins):
+
+    1. ``LEAN_PROJECT_ROOT`` environment variable (absolute path).
+    2. ``[mcp] project_root`` in the loaded config.toml. Relative paths are
+       resolved against the config file's directory.
+    3. Current working directory — the default when leanloop.py or Qwen CLI
+       launches this server from the project directory.
+    """
+    # 1. Environment variable override
+    if env_root := os.environ.get("LEAN_PROJECT_ROOT"):
+        return Path(env_root).resolve()
+
+    # 2. Config file override
+    if cfg_root := MCP_CFG.get("project_root"):
+        p = Path(cfg_root)
+        if not p.is_absolute() and CONFIG_DIR is not None:
+            p = (CONFIG_DIR / p).resolve()
+        return p
+
+    # 3. Default: inherit from the parent process (leanloop / Qwen CLI cwd)
     return Path.cwd()
 
 
@@ -608,7 +688,8 @@ def rg_context(
     rg_args = [
         "--no-heading", "--color", "never",
         "-n",
-        "-C", f"{before},{after}",
+        "-B", str(before),
+        "-A", str(after),
         query,
         path,
     ]
@@ -697,11 +778,418 @@ def rg_context(
 
 
 # ---------------------------------------------------------------------------
+# Symbol finder — in-memory index lookup
+# ---------------------------------------------------------------------------
+
+
+@server.tool(
+    name="find_symbol",
+    description=(
+        "Find where a symbol (function, class, constant, variable) is defined "
+        "in the codebase. Returns structured JSON keyed by symbol name — each "
+        "value has file path, line number, type, and detected language. "
+        "Python symbols are extracted via AST (distinguishes method vs "
+        "function); JavaScript/TypeScript via regex. "
+        "The index is built once at server startup and held in memory — "
+        "lookups are O(1) with no ripgrep subprocess. "
+        "Exact match by default; pass fuzzy=true to also find symbols whose "
+        "name starts with the query (e.g. 'auth' matches 'authenticate', "
+        "'authManager', 'authorize'). "
+        "Multiple definitions of the same symbol name are returned as an array. "
+        "Narrow the search with the path parameter (e.g. 'backend/', 'src/')."
+    ),
+)
+def find_symbol(
+    name: str,
+    path: str = ".",
+    fuzzy: bool = False,
+) -> str:
+    """Look up symbol definitions from the in-memory index.
+
+    Args:
+        name: Symbol name to search for (e.g. ``"authenticate"``).
+        path: Directory to filter by (relative to repo root, default ``"."``).
+        fuzzy: When true, also matches symbols whose name starts with
+               ``name`` (e.g. ``"auth"`` matches ``authenticate``,
+               ``authManager``, ``authorize``).
+
+    Returns:
+        JSON with ``symbols`` dict keyed by symbol name. Each value is a
+        single ``{file, line, type, language}`` object or an array.
+    """
+    _log("find_symbol", name=name, path=path, fuzzy=fuzzy)
+
+    # Collect matching entries from the in-memory index
+    if fuzzy:
+        matches: dict[str, list[dict]] = {}
+        for key, entries in _SYMBOL_INDEX.items():
+            if key.startswith(name):
+                matches[key] = entries
+    else:
+        entries = _SYMBOL_INDEX.get(name, [])
+        matches = {name: entries} if entries else {}
+
+    # Filter by path scope
+    if path != "." and matches:
+        path_prefix = path.rstrip("/") + "/"
+        filtered: dict[str, list[dict]] = {}
+        for sym_name, entries in matches.items():
+            kept = [e for e in entries if e["file"].startswith(path_prefix)]
+            if kept:
+                filtered[sym_name] = kept
+        matches = filtered
+
+    # Format: single entry → object, multiple → array
+    symbols: dict = {}
+    for sym_name, entries in matches.items():
+        if len(entries) == 1:
+            symbols[sym_name] = entries[0]
+        else:
+            symbols[sym_name] = entries
+
+    _log("find_symbol.result", names=len(symbols), total=sum(
+        1 if isinstance(v, dict) else len(v)
+        for v in symbols.values()
+    ))
+
+    result: dict = {"symbols": symbols}
+    if not symbols:
+        result["hint"] = (
+            f"No definition found for '{name}'. "
+            "Try fuzzy=true for partial matches, or use rg_search "
+            "to find usages instead of definitions."
+        )
+    return json.dumps(result, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# Index rebuild — re-expose the startup indexer as a callable tool
+# ---------------------------------------------------------------------------
+
+
+@server.tool(
+    name="rebuild_index",
+    description=(
+        "Rebuild the in-memory symbol index from scratch. "
+        "Call this after making code changes (new files, new functions, renames) "
+        "so that find_symbol and find_usages see the latest definitions. "
+        "Returns the same stats as startup: py_files, js_files, symbols, "
+        "unique_names, and elapsed_ms."
+    ),
+)
+def rebuild_index() -> str:
+    """Re-run the AST+regex indexer and replace the in-memory index."""
+    global _SYMBOL_INDEX, _INDEX_BY_FILE
+    repo_root = _get_repo_root()
+    _build_symbol_index(repo_root)
+    stats = {
+        "symbols": sum(len(v) for v in _SYMBOL_INDEX.values()),
+        "unique_names": len(_SYMBOL_INDEX),
+    }
+    return json.dumps({"status": "ok", **stats}, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# find_usages — "who calls this function?"
+# ---------------------------------------------------------------------------
+
+
+def _build_usages_regex(name: str, symbol_type: str | None) -> str:
+    """Build a regex pattern for finding usages of a symbol.
+
+    For functions/methods: matches ``name(`` (call sites).
+    For classes: matches ``name`` as a whole word (instantiation, type hints).
+    Falls back to word-boundary match when type is unknown.
+    """
+    if symbol_type in ("function", "method"):
+        return rf"\b{re.escape(name)}\s*\("
+    # class, constant, variable, or unknown — word-boundary match
+    return rf"\b{re.escape(name)}\b"
+
+
+_DEFINITION_KEYWORDS = {
+    "python": {"def ", "class ", "async def "},
+    "javascript": {"function ", "class ", "const ", "let ", "var "},
+}
+
+
+def _looks_like_definition(line: str, name: str, language: str | None) -> bool:
+    """Heuristic: does this line look like it's defining *name*?"""
+    keywords = _DEFINITION_KEYWORDS.get(language or "", set())
+    stripped = line.strip()
+    for kw in keywords:
+        if stripped.startswith(kw) and name in stripped:
+            return True
+    return False
+
+
+@server.tool(
+    name="find_usages",
+    description=(
+        "Find every call site / usage of a symbol (function, class, constant, "
+        "variable). Uses the in-memory symbol index to determine the symbol's "
+        "type, then runs a targeted ripgrep search: "
+        "functions/methods → matches ``name(``; "
+        "classes/constants → matches ``name`` as a word. "
+        "Definition sites (from the symbol index) are excluded so you only see "
+        "callers and references, not the definition itself. "
+        "Narrow the search with the path parameter (e.g. 'backend/', 'src/'). "
+        "Use this for debugging: 'who calls this?', 'where is this class used?', "
+        "'what code depends on this function?'"
+    ),
+)
+def find_usages(
+    name: str,
+    path: str = ".",
+) -> str:
+    """Find all usages of a symbol across the repository.
+
+    Args:
+        name: Symbol name to find usages of.
+        path: Directory to scope the search to (default '.').
+
+    Returns:
+        JSON with ``usages`` list, each entry having file, line, text,
+        and a ``definition`` boolean that is False for call sites.
+    """
+    _log("find_usages", name=name, path=path)
+
+    # Determine symbol type(s) from the index
+    entries = _SYMBOL_INDEX.get(name, [])
+    symbol_types = {e["type"] for e in entries}
+    primary_type = next(iter(symbol_types), None) if len(symbol_types) == 1 else None
+
+    # Build the search regex based on type
+    pattern = _build_usages_regex(name, primary_type)
+
+    # Collect definition sites to filter out
+    def_sites: set[tuple[str, int]] = set()
+    for entry in entries:
+        def_sites.add((entry["file"], entry["line"]))
+
+    # Run ripgrep
+    repo_root = _get_repo_root()
+    rg_args = ["--no-heading", "-n", "--color", "never", pattern, path]
+
+    retcode, stdout, stderr = _run_rg(rg_args, str(repo_root))
+
+    if retcode == 2:
+        return json.dumps({"error": f"rg error: {stderr.strip()}"})
+    if retcode == -1:
+        return json.dumps({"error": stderr.strip()})
+
+    usages: list[dict] = []
+    files_seen: dict[str, int] = {}
+    def_count = 0
+    for line in stdout.splitlines():
+        parsed = _parse_rg_line(line)
+        if parsed is None:
+            continue
+        fpath = _normalize_rg_path(parsed["file"])
+        ln = parsed["line"]
+        txt = parsed["text"]
+
+        # Skip definition sites
+        if (fpath, ln) in def_sites and _looks_like_definition(
+            txt, name, entries[0]["language"] if entries else None
+        ):
+            def_count += 1
+            continue
+
+        usages.append({
+            "file": fpath,
+            "line": ln,
+            "text": txt.strip(),
+            "definition": False,
+        })
+        files_seen[fpath] = files_seen.get(fpath, 0) + 1
+
+        if len(usages) >= RG_MAX_RESULTS:
+            break
+
+    _log("find_usages.result",
+         usages=len(usages),
+         files=len(files_seen),
+         definitions_filtered=def_count)
+
+    result: dict = {
+        "symbol": name,
+        "type": primary_type or list(symbol_types) if symbol_types else "unknown",
+        "usages": usages,
+        "total": len(usages),
+        "files_affected": len(files_seen),
+    }
+    if len(usages) >= RG_MAX_RESULTS:
+        result["truncated"] = True
+        result["hint"] = (
+            f"Results capped at {RG_MAX_RESULTS}. Narrow with the path parameter."
+        )
+    if not usages:
+        result["hint"] = (
+            f"No usages found for '{name}' outside its definition site(s). "
+            "Try a broader path scope or check the symbol name."
+        )
+    return json.dumps(result, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# read_symbol — read the full source of a function or class
+# ---------------------------------------------------------------------------
+
+
+def _read_symbol_source(
+    file_path: Path, start_line: int, language: str
+) -> str | None:
+    """Read the complete source of a symbol starting at *start_line*.
+
+    For Python: tracks indentation — reads until a non-blank line with
+    indentation <= the definition line's indentation.
+    For JS/TS: tracks brace nesting from the first ``{``.
+
+    Returns the source text or None on error.
+    """
+    try:
+        lines = file_path.read_text().splitlines()
+    except (OSError, UnicodeDecodeError):
+        return None
+
+    if start_line < 1 or start_line > len(lines):
+        return None
+
+    idx = start_line - 1  # 0-based
+
+    if language == "python":
+        # Measure indentation of the definition line
+        def_line = lines[idx]
+        if not def_line.strip():
+            return None
+        base_indent = len(def_line) - len(def_line.lstrip())
+
+        # Collect lines until we hit a non-blank line with indentation <= base_indent
+        # (skipping the definition line itself)
+        out = [def_line]
+        for i in range(idx + 1, len(lines)):
+            line = lines[i]
+            stripped = line.strip()
+            if not stripped:
+                out.append(line)
+                continue
+            indent = len(line) - len(line.lstrip())
+            if indent <= base_indent:
+                break
+            out.append(line)
+        return "\n".join(out)
+
+    # JavaScript / TypeScript: brace-counting approach
+    out = [lines[idx]]
+    brace_depth = 0
+    started = False
+    for i in range(idx, len(lines)):
+        line = lines[i]
+        if i == idx:
+            # Count braces on the definition line
+            brace_depth += line.count("{") - line.count("}")
+            if brace_depth > 0:
+                started = True
+            continue
+
+        if not started:
+            # Haven't seen an opening brace — look for one on subsequent lines
+            # (handles multi-line signatures)
+            brace_depth += line.count("{") - line.count("}")
+            out.append(line)
+            if brace_depth > 0:
+                started = True
+            continue
+
+        brace_depth += line.count("{") - line.count("}")
+        out.append(line)
+        if brace_depth <= 0:
+            break
+
+    return "\n".join(out)
+
+
+@server.tool(
+    name="read_symbol",
+    description=(
+        "Read the full source code of a named symbol (function, method, class) "
+        "from its definition to the closing brace / outdent. "
+        "Uses the in-memory symbol index to find the file and line number, "
+        "then extracts the complete body. "
+        "For Python: indentation-based boundary detection. "
+        "For JavaScript/TypeScript: brace-counting boundary detection. "
+        "If multiple definitions of the same name exist, reads the first one. "
+        "Use this instead of read_file + line counting for quickly viewing "
+        "a function or class implementation."
+    ),
+)
+def read_symbol(
+    name: str,
+) -> str:
+    """Read the source of a symbol defined in the codebase.
+
+    Args:
+        name: Exact symbol name to read.
+
+    Returns:
+        JSON with ``symbol``, ``file``, ``line``, ``language``, and ``source``.
+    """
+    _log("read_symbol", name=name)
+
+    entries = _SYMBOL_INDEX.get(name, [])
+    if not entries:
+        return json.dumps({
+            "error": f"Symbol '{name}' not found in index. "
+                      "Try rebuild_index if code was recently added."
+        })
+
+    # Pick the first entry (if multiple, caller can disambiguate by path)
+    entry = entries[0]
+    repo_root = _get_repo_root()
+    file_path = repo_root / entry["file"]
+
+    source = _read_symbol_source(file_path, entry["line"], entry["language"])
+    if source is None:
+        return json.dumps({"error": f"Could not read {entry['file']}"})
+
+    line_count = source.count("\n") + 1
+    _log("read_symbol.result", name=name, file=entry["file"],
+         line=entry["line"], lines=line_count)
+
+    return json.dumps({
+        "symbol": name,
+        "file": entry["file"],
+        "line": entry["line"],
+        "type": entry["type"],
+        "language": entry["language"],
+        "lines": line_count,
+        "source": source,
+    }, indent=2)
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
 
 def main() -> None:
+    repo_root = _get_repo_root()
+    _log(
+        "startup",
+        repo_root=str(repo_root),
+        cwd=str(Path.cwd()),
+        config_dir=str(CONFIG_DIR) if CONFIG_DIR else "none",
+    )
+    _build_symbol_index(repo_root)
+
+    # Write PID file so leanloop.py can find and kill stale servers.
+    _write_pid_file()
+
+    # Start parent-liveness monitor — exits the process when Qwen dies,
+    # preventing orphaned servers that sit in select() forever.
+    threading.Thread(target=_parent_monitor, daemon=True, name="parent-monitor").start()
+
     server.run(transport="stdio")
 
 
